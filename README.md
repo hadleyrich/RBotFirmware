@@ -1,5 +1,11 @@
-RBotFirmware
+Forked from RobDobson RBotFirmware
 ============
 
-Firmware for an ESP32 or Particle device to control robots of various geometries
-More information here http://robdobson.com/2017/02/a-line-in-the-sand/
+Plan / Todo:
+
+1) Remove Particle device support. 
+2) Move web pages to Spiffs Storage
+3) Create a "configuration" web page, linked from Sand and CNC UI pages. 
+4) Improve getting started documentation and system prompts. 
+
+Update this page when substaintially complete on the above. 
