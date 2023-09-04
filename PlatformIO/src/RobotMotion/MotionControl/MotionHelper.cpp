@@ -12,8 +12,10 @@
 
 static const char* MODULE_PREFIX = "MotionHelper: ";
 
-MotionHelper::MotionHelper() : _motionActuator(_motionIO, &_motionPipeline),
-                               _motionHoming(this)
+MotionHelper::MotionHelper() : 
+            _trinamicsController(_axesParams, _motionPipeline),
+            _rampGenerator(&_motionPipeline),
+            _motionHoming(this)
 {
     // Init
     _isPaused = false;
@@ -22,7 +24,8 @@ MotionHelper::MotionHelper() : _motionActuator(_motionIO, &_motionPipeline),
     _allowAllOutOfBounds = false;
     // Clear axis current location
     _lastCommandedAxisPos.clear();
-    _motionActuator.resetTotalStepPosition();
+    _rampGenerator.resetTotalStepPosition();
+    _trinamicsController.resetTotalStepPosition();
     // Coordinate conversion management
     _ptToActuatorFn = NULL;
     _actuatorToPtFn = NULL;
@@ -61,6 +64,10 @@ void MotionHelper::setTransforms(ptToActuatorFnType ptToActuatorFn, actuatorToPt
 // Configure the robot and pipeline parameters using a JSON input string
 void MotionHelper::configure(const char *robotConfigJSON)
 {
+    // Stop motion actuator
+    _rampGenerator.stop();
+    _trinamicsController.stop();
+    
     // Config geometry
     String robotGeom = RdJson::getString("robotGeom", "NONE", robotConfigJSON);
 
@@ -78,8 +85,10 @@ void MotionHelper::configure(const char *robotConfigJSON)
     // Motion Pipeline and Planner
     _motionPlanner.configure(junctionDeviation);
 
-    // MotionIO
-    _motionIO.deinit();
+    // Clean up previous
+    _trinamicsController.deinit();
+    _rampGenerator.deinit();
+    _motorEnabler.deinit();
 
     // Configure Axes
     _axesParams.clearAxes();
@@ -88,8 +97,10 @@ void MotionHelper::configure(const char *robotConfigJSON)
     {
         if (_axesParams.configureAxis(robotGeom.c_str(), axisIdx, axisJSON))
         {
-            // Configure motionIO - motors and end-stops
-            _motionIO.configureAxis(axisJSON.c_str(), axisIdx);
+            // Configure ramp generator - motors and end-stops
+            _rampGenerator.configureAxis(axisIdx, axisJSON.c_str());
+            // Configure ramp generator - motors and end-stops
+            _trinamicsController.configureAxis(axisIdx, axisJSON.c_str());
         }
     }
 
@@ -100,18 +111,19 @@ void MotionHelper::configure(const char *robotConfigJSON)
     // Homing
     _motionHoming.configure(robotGeom.c_str());    
 
-    // MotionIO
-    _motionIO.configureMotors(robotGeom.c_str());
+    // Trinamic controller
+    _trinamicsController.configure(robotGeom.c_str());
 
-    // Give the MotionActuator access to raw motionIO info
-    // this enables ISR based motion to be faster
-    RobotConsts::RawMotionHwInfo_t rawMotionHwInfo;
-    _motionIO.getRawMotionHwInfo(rawMotionHwInfo);
-    _motionActuator.setRawMotionHwInfo(rawMotionHwInfo);
+    // Motor enabler
+    _motorEnabler.configure(robotGeom.c_str());
+
+    // Start motion actuator
+    _rampGenerator.configure(!_trinamicsController.isRampGenerator());
 
     // Clear motion info
     _lastCommandedAxisPos.clear();
-    _motionActuator.resetTotalStepPosition();
+    _rampGenerator.resetTotalStepPosition();
+    _trinamicsController.resetTotalStepPosition();
 }
 
 // Check if a command can be accepted into the motion pipeline
@@ -127,7 +139,8 @@ bool MotionHelper::canAccept()
 // Pause (or un-pause) all motion
 void MotionHelper::pause(bool pauseIt)
 {
-    _motionActuator.pause(pauseIt);
+    _rampGenerator.pause(pauseIt);
+    _trinamicsController.pause(pauseIt);
     _isPaused = pauseIt;
 }
 
@@ -143,7 +156,8 @@ void MotionHelper::stop()
     _blocksToAddTotal = 0;
     _stopRequested = true;
     _stopRequestTimeMs = millis();
-    _motionActuator.stop();
+    _rampGenerator.stop();
+    _trinamicsController.stop();
     _motionPipeline.clear();
     pause(false);
     setCurPosActualPosition();
@@ -161,7 +175,10 @@ void MotionHelper::setCurPosActualPosition()
     // ensure any final step is completed
     delayMicroseconds(100);
     AxisInt32s actuatorPos;
-    _motionActuator.getTotalStepPosition(actuatorPos);
+    if (_trinamicsController.isRampGenerator())
+        _trinamicsController.getTotalStepPosition(actuatorPos);
+    else
+        _rampGenerator.getTotalStepPosition(actuatorPos);
     AxisFloats curPosMM;
     if (_actuatorToPtFn)
         _actuatorToPtFn(actuatorPos, curPosMM, _lastCommandedAxisPos, _axesParams);
@@ -191,7 +208,10 @@ void MotionHelper::getCurStatus(RobotCommandArgs &args)
 {
     // Get current position
     AxisInt32s curActuatorPos;
-    _motionActuator.getTotalStepPosition(curActuatorPos);
+    if (_trinamicsController.isRampGenerator())
+        _trinamicsController.getTotalStepPosition(curActuatorPos);
+    else
+        _rampGenerator.getTotalStepPosition(curActuatorPos);
     args.setPointSteps(curActuatorPos);
     // Use reverse kinematics to get location
     AxisFloats curMMPos;
@@ -200,7 +220,7 @@ void MotionHelper::getCurStatus(RobotCommandArgs &args)
     args.setPointMM(curMMPos);
     // Get end-stop values
     AxisMinMaxBools endstops;
-    _motionIO.getEndStopVals(endstops);
+    _rampGenerator.getEndStopStatus(endstops);
     args.setEndStops(endstops);
     // Absolute/Relative movement
     args.setMoveType(_moveRelative ? RobotMoveTypeArg_Relative : RobotMoveTypeArg_Absolute);
@@ -343,7 +363,7 @@ void MotionHelper::blocksToAddProcess()
         addToPlanner(_blocksToAddCommandArgs);
 
         // Enable motors
-        _motionIO.enableMotors(true, false);
+        _motorEnabler.enableMotors(true, false);
     }
 }
 
@@ -407,7 +427,8 @@ void MotionHelper::service()
         if (Utils::isTimeout(millis(), _stopRequestTimeMs, MAX_TIME_BEFORE_STOP_COMPLETE_MS))
         {
             _blocksToAddTotal = 0;
-            _motionActuator.stop();
+            _rampGenerator.stop();
+            _trinamicsController.stop();
             _motionPipeline.clear();
             pause(false);
             setCurPosActualPosition();
@@ -417,20 +438,22 @@ void MotionHelper::service()
 
     // Call process on motion actuator - only really used for testing as
     // motion is handled by ISR
-    _motionActuator.process();
+    _rampGenerator.process();
+
+    // Process for trinamic devices
+    _trinamicsController.process();
 
     // Process any split-up blocks to be added to the pipeline
     blocksToAddProcess();
 
-    // Service MotionIO
-    if (_motionPipeline.count() > 0)
-        _motionIO.motionIsActive();
-    _motionIO.service();
-
     // Service homing
     _motionHoming.service(_axesParams);
-    if (_motionHoming.isHomingInProgress())
-        _motionIO.motionIsActive();
+
+    // Ensure motors enabled when homing or moving
+    if ((_motionPipeline.count() > 0) || _motionHoming.isHomingInProgress())
+    {
+        _motorEnabler.enableMotors(true, false);
+    }
 }
 
 // Set home coordinates
@@ -440,7 +463,8 @@ void MotionHelper::setCurPositionAsHome(int axisIdx)
         return;
     _lastCommandedAxisPos._axisPositionMM.setVal(axisIdx, _axesParams.getHomeOffsetVal(axisIdx));
     _lastCommandedAxisPos._stepsFromHome.setVal(axisIdx, _axesParams.gethomeOffSteps(axisIdx));
-    _motionActuator.setTotalStepPosition(axisIdx, _axesParams.gethomeOffSteps(axisIdx));
+    _rampGenerator.setTotalStepPosition(axisIdx, _axesParams.gethomeOffSteps(axisIdx));
+    _trinamicsController.setTotalStepPosition(axisIdx, _axesParams.gethomeOffSteps(axisIdx));
 #ifdef DEBUG_MOTION_HELPER
     Log.trace("%ssetCurPosAsHome curMM X%F Y%F Z%F steps %d,%d,%d\n", MODULE_PREFIX,
                 _lastCommandedAxisPos._axisPositionMM.getVal(0),
@@ -465,7 +489,7 @@ void MotionHelper::debugShowTopBlock()
 
 String MotionHelper::getDebugStr()
 {
-    return _motionActuator.getDebugStr();
+    return _rampGenerator.getDebugStr();
 }
 
 int MotionHelper::testGetPipelineCount()

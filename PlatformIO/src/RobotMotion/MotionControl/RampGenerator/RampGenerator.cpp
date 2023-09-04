@@ -1,9 +1,9 @@
 // RBotFirmware
 // Rob Dobson 2018
 
-#include "MotionActuator.h"
+#include "RampGenerator.h"
 #include "MotionInstrumentation.h"
-#include "MotionPipeline.h"
+#include "../MotionPipeline.h"
 
 //#define USE_FAST_PIN_ACCESS 1
 
@@ -12,52 +12,64 @@ INSTRUMENT_MOTION_ACTUATOR_INSTANCE
 
 //#define DEBUG_MONITOR_ISR_OPERATION 1
 
-#ifdef USE_ESP32_TIMER_ISR
-// Static interval timer
-hw_timer_t *MotionActuator::_isrMotionTimer;
-#endif
+// #ifdef USE_ESP32_TIMER_ISR
+// // Static interval timer
+// hw_timer_t *RampGenerator::_isrMotionTimer;
+// #endif
 
-// Static refrerence to a single MotionActuator instance
-volatile int32_t MotionActuator::_totalStepsMoved[RobotConsts::MAX_AXES];
-volatile int32_t MotionActuator::_totalStepsInc[RobotConsts::MAX_AXES];
-RobotConsts::RawMotionHwInfo_t MotionActuator::_rawMotionHwInfo;
-MotionPipeline* MotionActuator::_pMotionPipeline = NULL;
-volatile bool MotionActuator::_isPaused = false;
-bool MotionActuator::_isEnabled = false;
-bool MotionActuator::_endStopReached = false;
-int MotionActuator::_lastDoneNumberedCmdIdx = 0;
-uint32_t MotionActuator::_stepsTotalAbs[RobotConsts::MAX_AXES];
-uint32_t MotionActuator::_curStepCount[RobotConsts::MAX_AXES];
-uint32_t MotionActuator::_curStepRatePerTTicks = 0;
-uint32_t MotionActuator::_curAccumulatorStep = 0;
-uint32_t MotionActuator::_curAccumulatorNS = 0;
-uint32_t MotionActuator::_curAccumulatorRelative[RobotConsts::MAX_AXES];
-int MotionActuator::_endStopCheckNum;
-MotionActuator::EndStopChecks MotionActuator::_endStopChecks[RobotConsts::MAX_AXES];
+// Static refrerence to a single RampGenerator instance
+// volatile int32_t RampGenerator::_axisTotalSteps[RobotConsts::MAX_AXES];
+// volatile int32_t RampGenerator::_totalStepsInc[RobotConsts::MAX_AXES];
+// RobotConsts::RawMotionHwInfo_t RampGenerator::_rawMotionHwInfo;
+// MotionPipeline* RampGenerator::_pMotionPipeline = NULL;
+// volatile bool RampGenerator::_isPaused = false;
+// bool RampGenerator::_isEnabled = false;
+// bool RampGenerator::_endStopReached = false;
+// int RampGenerator::_lastDoneNumberedCmdIdx = 0;
+// uint32_t RampGenerator::_stepsTotalAbs[RobotConsts::MAX_AXES];
+// uint32_t RampGenerator::_curStepCount[RobotConsts::MAX_AXES];
+// uint32_t RampGenerator::_curStepRatePerTTicks = 0;
+// uint32_t RampGenerator::_curAccumulatorStep = 0;
+// uint32_t RampGenerator::_curAccumulatorNS = 0;
+// uint32_t RampGenerator::_curAccumulatorRelative[RobotConsts::MAX_AXES];
+// int RampGenerator::_endStopCheckNum;
+// RampGenerator::EndStopChecks RampGenerator::_endStopChecks[RobotConsts::MAX_AXES];
+// bool RampGenerator::_isrTimerStarted = false;
+// RampGenIO* RampGenerator::_pMotionIO = NULL;
+// bool RampGenerator::_rampGenEnabled = false;
 
-MotionActuator::MotionActuator(MotionIO &motionIO, MotionPipeline* pMotionPipeline)
+RampGenerator* RampGenerator::_pThis = NULL;
+
+RampGenerator::RampGenerator(MotionPipeline* pMotionPipeline)
 {
+    // Static refrerence to a single RampGenerator instance
+    _pThis = this;
+
     // Init
     _pMotionPipeline = pMotionPipeline;
-    clear();
-    resetTotalStepPosition();
+    _isPaused = true;
+    _endStopReached = false;
+    _lastDoneNumberedCmdIdx = RobotConsts::NUMBERED_COMMAND_NONE;
+    _isEnabled = false;
+    _curStepRatePerTTicks = 0;
+    _curAccumulatorStep = 0;
+    _curAccumulatorNS = 0;
+    _endStopCheckNum = 0;
+    _isrTimerStarted = false;
+    _rampGenEnabled = false;
 
-    // If we are using the ISR then create the Spark Interval Timer and start it
-#ifdef USE_ESP32_TIMER_ISR
-    _isrMotionTimer = timerBegin(0, CLOCK_RATE_MHZ, true);
-    timerAttachInterrupt(_isrMotionTimer, _isrStepperMotion, true);
-    timerAlarmWrite(_isrMotionTimer, ISR_TIMER_PERIOD_US, true);
-    timerAlarmEnable(_isrMotionTimer);
-    Log.notice("MotionActuator: Starting ISR timer\n");
+#ifdef TEST_MOTION_ACTUATOR_ENABLE
+    _pMotionInstrumentation = NULL;
 #endif
+    resetTotalStepPosition();
 }
 
-void MotionActuator::setRawMotionHwInfo(RobotConsts::RawMotionHwInfo_t &rawMotionHwInfo)
-{
-    _rawMotionHwInfo = rawMotionHwInfo;
-}
+// void RampGenerator::setRawMotionHwInfo(RobotConsts::RawMotionHwInfo_t &rawMotionHwInfo)
+// {
+//     _rawMotionHwInfo = rawMotionHwInfo;
+// }
 
-void MotionActuator::setInstrumentationMode(const char *testModeStr)
+void RampGenerator::setInstrumentationMode(const char *testModeStr)
 {
 #ifdef INSTRUMENT_MOTION_ACTUATOR_ENABLE
     _pMotionInstrumentation = new MotionInstrumentation();
@@ -65,27 +77,54 @@ void MotionActuator::setInstrumentationMode(const char *testModeStr)
 #endif
 }
 
-void MotionActuator::config()
+void RampGenerator::deinit()
 {
-}
-
-void MotionActuator::clear()
-{
-    _isPaused = true;
-    _endStopReached = false;
-    _lastDoneNumberedCmdIdx = RobotConsts::NUMBERED_COMMAND_NONE;
-#ifdef TEST_MOTION_ACTUATOR_ENABLE
-    _pMotionInstrumentation = NULL;
+#ifdef USE_ESP32_TIMER_ISR
+    if (_isrTimerStarted)
+    {
+        timerAlarmDisable(_isrMotionTimer);
+        _isrTimerStarted = false;
+    }
 #endif
 }
 
-void MotionActuator::stop()
+void RampGenerator::configure(bool rampGenEnabled)
+{
+    // Cache axis and endstop info
+    _rampGenIO.getRawMotionHwInfo(_rawMotionHwInfo);
+
+    // TODO check we don't need this...
+
+    // // Give the RampGenerator access to raw motionIO info
+    // // this enables ISR based motion to be faster
+    // RobotConsts::RawMotionHwInfo_t rawMotionHwInfo;
+    // _rampGenerator.setRawMotionHwInfo(rawMotionHwInfo);
+
+
+
+
+    _rampGenEnabled = rampGenEnabled;
+    // If we are using the ISR then create the Spark Interval Timer and start it
+#ifdef USE_ESP32_TIMER_ISR
+    if (_rampGenEnabled)
+    {
+        Log.notice("RampGenerator: Starting ISR timer for direct stepping\n");
+        _isrMotionTimer = timerBegin(0, CLOCK_RATE_MHZ, true);
+        timerAttachInterrupt(_isrMotionTimer, _staticISRStepperMotion, true);
+        timerAlarmWrite(_isrMotionTimer, DIRECT_STEP_ISR_TIMER_PERIOD_US, true);
+        timerAlarmEnable(_isrMotionTimer);
+        _isrTimerStarted = true;
+    }
+#endif
+}
+
+void RampGenerator::stop()
 {
     _isPaused = true;
     _endStopReached = false;
 }
 
-void MotionActuator::pause(bool pauseIt)
+void RampGenerator::pause(bool pauseIt)
 {
     _isPaused = pauseIt;
     if (!_isPaused)
@@ -94,62 +133,59 @@ void MotionActuator::pause(bool pauseIt)
     }
 }
 
-void MotionActuator::resetTotalStepPosition()
+void RampGenerator::resetTotalStepPosition()
 {
     for (int i = 0; i < RobotConsts::MAX_AXES; i++)
     {
-        _totalStepsMoved[i] = 0;
+        _axisTotalSteps[i] = 0;
         _totalStepsInc[i] = 0;
     }
 }
-void MotionActuator::getTotalStepPosition(AxisInt32s& actuatorPos)
+void RampGenerator::getTotalStepPosition(AxisInt32s& actuatorPos)
 {
     for (int i = 0; i < RobotConsts::MAX_AXES; i++)
     {
-        actuatorPos.setVal(i, _totalStepsMoved[i]);
+        actuatorPos.setVal(i, _axisTotalSteps[i]);
     }
 }
-void MotionActuator::setTotalStepPosition(int axisIdx, int32_t stepPos)
+void RampGenerator::setTotalStepPosition(int axisIdx, int32_t stepPos)
 {
     if ((axisIdx >= 0) && (axisIdx < RobotConsts::MAX_AXES))
-        _totalStepsMoved[axisIdx] = stepPos;
+        _axisTotalSteps[axisIdx] = stepPos;
 }
-void MotionActuator::clearEndstopReached()
+void RampGenerator::clearEndstopReached()
 {
     _endStopReached = false;
 }
 
-bool MotionActuator::isEndStopReached()
+bool RampGenerator::isEndStopReached()
 {
     return _endStopReached;
 }
 
-int MotionActuator::getLastCompletedNumberedCmdIdx()
+int RampGenerator::getLastCompletedNumberedCmdIdx()
 {
     return _lastDoneNumberedCmdIdx;
 }
 
 // Handle the end of a step for any axis
-bool IRAM_ATTR MotionActuator::handleStepEnd()
+bool IRAM_ATTR RampGenerator::handleStepEnd()
 {
     bool anyPinReset = false;
     for (int axisIdx = 0; axisIdx < RobotConsts::MAX_AXES; axisIdx++)
     {
-        RobotConsts::RawMotionAxis_t *pAxisInfo = &_rawMotionHwInfo._axis[axisIdx];
-        if (pAxisInfo->_pinStepCurLevel == 1)
+        if (_rampGenIO.stepEnd(axisIdx))
         {
-            digitalWrite(pAxisInfo->_pinStep, 0);
             anyPinReset = true;
-            _totalStepsMoved[axisIdx] += _totalStepsInc[axisIdx];
+            _axisTotalSteps[axisIdx] += _totalStepsInc[axisIdx];
         }
-        pAxisInfo->_pinStepCurLevel = 0;
     }
     return anyPinReset;
 }
 
 // Setup new block - cache all the info needed to process the block and reset
 // motion accumulators to facilitate the block's execution
-void IRAM_ATTR MotionActuator::setupNewBlock(MotionBlock *pBlock)
+void IRAM_ATTR RampGenerator::setupNewBlock(MotionBlock *pBlock)
 {
     // Setup step counts, direction and endstops for each axis
     _endStopCheckNum = 0;
@@ -161,13 +197,8 @@ void IRAM_ATTR MotionActuator::setupNewBlock(MotionBlock *pBlock)
         _curStepCount[axisIdx] = 0;
         _curAccumulatorRelative[axisIdx] = 0;
         // Set direction for the axis
-        RobotConsts::RawMotionAxis_t *pAxisInfo = &_rawMotionHwInfo._axis[axisIdx];
-        if (pAxisInfo->_pinDirection != -1)
-        {
-            digitalWrite(pAxisInfo->_pinDirection,
-                            (stepsTotal >= 0) == pAxisInfo->_pinDirectionReversed);
-            _totalStepsInc[axisIdx] = (stepsTotal >= 0) ? 1 : -1;
-        }
+        _rampGenIO.setDirection(axisIdx, stepsTotal >= 0);
+        _totalStepsInc[axisIdx] = (stepsTotal >= 0) ? 1 : -1;
 
         // Instrumentation
         INSTRUMENT_MOTION_ACTUATOR_STEP_DIRN
@@ -225,7 +256,7 @@ void IRAM_ATTR MotionActuator::setupNewBlock(MotionBlock *pBlock)
 }
 
 // Update millisecond accumulator to handle acceleration and deceleration
-void IRAM_ATTR MotionActuator::updateMSAccumulator(MotionBlock *pBlock)
+void IRAM_ATTR RampGenerator::updateMSAccumulator(MotionBlock *pBlock)
 {
     // Bump the millisec accumulator
     _curAccumulatorNS += MotionBlock::TICK_INTERVAL_NS;
@@ -252,7 +283,7 @@ void IRAM_ATTR MotionActuator::updateMSAccumulator(MotionBlock *pBlock)
 }
 
 // Handle start of step on each axis
-bool IRAM_ATTR MotionActuator::handleStepMotion(MotionBlock *pBlock)
+bool IRAM_ATTR RampGenerator::handleStepMotion(MotionBlock *pBlock)
 {
     // Complete Flag
     bool anyAxisMoving = false;
@@ -267,12 +298,7 @@ bool IRAM_ATTR MotionActuator::handleStepMotion(MotionBlock *pBlock)
     if (_curStepCount[axisIdxMaxSteps] < _stepsTotalAbs[axisIdxMaxSteps])
     {
         // Step this axis
-        RobotConsts::RawMotionAxis_t *pAxisInfo = &_rawMotionHwInfo._axis[axisIdxMaxSteps];
-        if (pAxisInfo->_pinStep != -1)
-        {
-            digitalWrite(pAxisInfo->_pinStep, 1);
-        }
-        pAxisInfo->_pinStepCurLevel = 1;
+        _rampGenIO.stepStart(axisIdxMaxSteps);
         _curStepCount[axisIdxMaxSteps]++;
         if (_curStepCount[axisIdxMaxSteps] < _stepsTotalAbs[axisIdxMaxSteps])
             anyAxisMoving = true;
@@ -295,13 +321,8 @@ bool IRAM_ATTR MotionActuator::handleStepMotion(MotionBlock *pBlock)
             _curAccumulatorRelative[axisIdx] -= _stepsTotalAbs[axisIdxMaxSteps];
 
             // Step the axis
-            RobotConsts::RawMotionAxis_t *pAxisInfo = &_rawMotionHwInfo._axis[axisIdx];
-            if (pAxisInfo->_pinStep != -1)
-            {
-                digitalWrite(pAxisInfo->_pinStep, 1);
-            }
-            // Log.trace("MotionActuator::procTick otherAxisStep: %d (ax %d)\n", pAxisInfo->_pinStep, axisIdx);
-            pAxisInfo->_pinStepCurLevel = 1;
+            _rampGenIO.stepStart(axisIdx);
+            // Log.trace("RampGenerator::procTick otherAxisStep: %d (ax %d)\n", pAxisInfo->_pinStep, axisIdx);
             _curStepCount[axisIdx]++;
             if (_curStepCount[axisIdx] < _stepsTotalAbs[axisIdx])
                 anyAxisMoving = true;
@@ -315,7 +336,7 @@ bool IRAM_ATTR MotionActuator::handleStepMotion(MotionBlock *pBlock)
     return anyAxisMoving;
 }
 
-void IRAM_ATTR MotionActuator::endMotion(MotionBlock *pBlock)
+void IRAM_ATTR RampGenerator::endMotion(MotionBlock *pBlock)
 {
     _pMotionPipeline->remove();
     // Check if this is a numbered block - if so record its completion
@@ -336,8 +357,14 @@ volatile int maxStepRt = -1;
 
 // Function that handles ISR calls based on a timer
 // When ISR is enabled this is called every MotionBlock::TICK_INTERVAL_NS nanoseconds
-void IRAM_ATTR MotionActuator::_isrStepperMotion(void)
+void IRAM_ATTR RampGenerator::_staticISRStepperMotion()
 {
+    if (_pThis)
+        _pThis->isrStepperMotion();
+}
+
+void IRAM_ATTR RampGenerator::isrStepperMotion()
+{    
     // Instrumentation code to time ISR execution (if enabled - see MotionInstrumentation.h)
     INSTRUMENT_MOTION_ACTUATOR_TIME_START
 
@@ -431,18 +458,25 @@ void IRAM_ATTR MotionActuator::_isrStepperMotion(void)
 }
 
 // Process method called by main program loop
-void MotionActuator::process()
+void RampGenerator::process()
 {
-    // If not using ISR call _isrStepperMotion on every process call
-#ifndef USE_ESP32_TIMER_ISR
-    _isrStepperMotion();
-#endif
+    // Service RampGenIO
+    _rampGenIO.service();
 
-    // Instrumentation - used to collect test information about operation of MotionActuator
+    // If using a controller with a ramp generator then service the block handling
+    if (_rampGenEnabled)
+    {
+        // If not using ISR call _isrStepperMotion on every process call
+#ifndef USE_ESP32_TIMER_ISR
+        _isrStepperMotion();
+#endif
+    }
+
+    // Instrumentation - used to collect test information about operation of RampGenerator
     INSTRUMENT_MOTION_ACTUATOR_PROCESS
 }
 
-String MotionActuator::getDebugStr()
+String RampGenerator::getDebugStr()
 {
 #ifdef INSTRUMENT_MOTION_ACTUATOR_ENABLE
     if (_pMotionInstrumentation)
@@ -459,7 +493,7 @@ String MotionActuator::getDebugStr()
     return "";
 }
 
-void MotionActuator::showDebug()
+void RampGenerator::showDebug()
 {
 #ifdef INSTRUMENT_MOTION_ACTUATOR_ENABLE
     if (_pMotionInstrumentation)
